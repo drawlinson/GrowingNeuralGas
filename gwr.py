@@ -57,7 +57,8 @@ class GrowingWhenRequired:
             'usage_initial':1.0,  # "values used in the experiments were: h_0 = 1"
             'usage_decay':0.8,  # Should be unit range
             'error_split': 0.5,  # What happens to accumulated error on split
-            'error_decay': 0.995  # Learning rate of error
+            'error_decay': 0.995,  # Learning rate of error
+            'utility_decay': 0.995,  # Learning rate of utility
         }
         return hparams
 
@@ -69,7 +70,6 @@ class GrowingWhenRequired:
         node_n = None
         for u, attributes in self.network.nodes(data=True):
             vector = attributes['vector']
-            #dist = spatial.distance.euclidean(vector, observation)
             dist = self.distance(vector, observation)
             if node_b is None:
                 node_b = u
@@ -92,12 +92,7 @@ class GrowingWhenRequired:
                 else:
                     node_n = u
                     dist_n = dist
-
-            #distance.append((u, dist))
-        #distance.sort(key=lambda x: x[1])
-        #ranking = [u for u, dist in distance]
-        #return ranking
-        return [node_b, node_n]
+        return [node_b, node_n], [dist_b, dist_n]
 
     def distance(self, vector, observation):
         dist = spatial.distance.euclidean(vector, observation)
@@ -159,8 +154,9 @@ class GrowingWhenRequired:
         """Ensure we push all node creation through this member fn to standardize properties of the nodes"""
         error_initial = 0.0
         usage_initial = self.hparams['usage_initial']
+        utility_initial = 0.0
         node_id = self.units_created
-        self.network.add_node(node_id, vector=vector, error=error_initial, usage=usage_initial)
+        self.network.add_node(node_id, vector=vector, error=error_initial, usage=usage_initial, utility=utility_initial)
         self.units_created += 1
         return node_id
 
@@ -172,10 +168,6 @@ class GrowingWhenRequired:
         self.network = nx.Graph()
         self.add_node(w_a)
         self.add_node(w_b)
-        #self.network.add_node(self.units_created, vector=w_a, error=0)
-        #self.units_created += 1
-        #self.network.add_node(self.units_created, vector=w_b, error=0)
-        #self.units_created += 1
 
     def can_grow(self):
         max_size = self.hparams['max_size']
@@ -203,6 +195,7 @@ class GrowingWhenRequired:
         self.network.node[q]['error'] *= a
         self.network.node[f]['error'] *= a
         self.network.node[r]['error'] = self.network.node[q]['error']
+        # Assume utility adjusts over time
         
     def update_usage(self, node_id, is_best):
         """Unlike the original GWR paper, I'm just going with a simple exponential decay."""
@@ -218,19 +211,27 @@ class GrowingWhenRequired:
         new_usage = old_usage * usage_decay
         node['usage'] = new_usage
 
+    def update_utility(self, node_id, current_utility):
+        """Update the utility of the specified node"""
+        node = self.network.node[node_id]
+        old_utility = node['utility']
+        utility_decay = self.hparams['utility_decay']
+        new_utility = (old_utility + current_utility) * utility_decay
+        node['usage'] = new_utility
+
     def update(self, observation, step):
         # Get hyperparameters
         growth_strategy = self.hparams['growth_strategy']
         e_b = self.hparams['learning_rate_best']
         e_n = self.hparams['learning_rate_neighbour']
         l = self.hparams['growth_interval']
-        #a = self.hparams['error_split']
-        #d = self.hparams['error_decay']
         
         # 2. find the nearest unit s_1 and the second nearest unit s_2
-        nearest_units = self.find_nearest_units(observation)
+        nearest_units, nearest_dists = self.find_nearest_units(observation)
         s_1 = nearest_units[0]
         s_2 = nearest_units[1]
+        error_1 = nearest_dists[0]
+        error_2 = nearest_dists[1]
 
         # 3. increment the age of all edges emanating from s_1
         #for u, v, attributes in self.network.edges_iter(data=True, nbunch=[s_1]):
@@ -258,8 +259,10 @@ class GrowingWhenRequired:
         did_split = False
         if growth_strategy == GrowingWhenRequired.GrowthStrategyRequired:
             # update firing (usage) rate for winning node and neighbours
+            utility = error_2 - error_1  # NB this is always positive as error 2 >= error 1, by definition
             best_usage = self.network.node[s_1]['usage']  # Keep old value
             self.update_usage(s_1, True)
+            self.update_utility(s_1, utility)
             for u in self.network.neighbors(s_1):
                 self.update_usage(u, False)
 
@@ -341,7 +344,7 @@ class GrowingWhenRequired:
         def compute_global_error(gng, data):
             global_error = 0
             for observation in data:
-                nearest_units = gng.find_nearest_units(observation)
+                nearest_units, nearest_dists = gng.find_nearest_units(observation)
                 s_1 = nearest_units[0]
                 #global_error += spatial.distance.euclidean(observation, gng.network.node[s_1]['vector'])**2
                 node = gng.network.node[s_1]['vector']
