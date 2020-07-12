@@ -23,6 +23,40 @@ Neural Networks 15(8-9) (2002) pp 1041-58
 
 Original code forked from GNG implementation at:
 https://github.com/AdrienGuille/GrowingNeuralGas
+
+A note on the intended dynamics.
+
+0. We desire to have an upper bound on resources (cells).
+
+1. Edges age when they compete with a winning edge, and aren't between winner and 2nd best.
+This means that cells representing rare input can persist for an arbitrarily long time.
+Useless cells will be removed when nearby useful ones are used instead.
+
+2. If the network has headroom to grow, we are OK to grow and prune at our leisure.
+This means the network has less than min_size quantity of cells. Min_size envisioned to be
+about 90% of max_size (say, reserviing 10% for rapid growth).
+
+3. The network can temporarily grow to max_size to accomodate new input. If the new input
+is transient, or it replaces old input that no longer occurs, the network will gradually
+shrink down again. Remember, the network only grows when required, so it may reach max_size.
+Whether this happens is controlled by activity_threshold hyperparameter.
+
+4. The optimality of cell distribution across the input space depends on being able to add
+and remove cells. Therefore if the network is > min_size, there's no guarantee the resource
+allocation is optimal.
+
+5. If the network exceeds min_size there is no room to learn new cells. If we require fast
+adaptation there will be a non-optimal allocation of resources. Therefore, we'd like to
+remove resources where an excess exists.
+
+6. The original GNG paper suggests not to prune cells based on edge-age, but to measure
+utility instead. I don't see any harm in keeping the age-based pruning rule. It can be
+disabled by making it negative (in this implementation).
+
+7. If we use utility to select cells for removal, we should only do it to "older" cells
+where the utility has had time to be defined. This is captured by the usage tracker.
+So we will remove cells with min utility, and enough usage, until we get down to min_size again.
+
 '''
 
 
@@ -49,10 +83,11 @@ class GrowingWhenRequired:
             'init_range':2.0,  # Uniform distribution
             'learning_rate_best': 0.1,
             'learning_rate_neighbour': 0.006,
-            'max_age': 10,  # Max age of an edge before it is removed
-            'max_size':-1,
+            'max_age': 10,  # Max age of an edge before it is removed. If negative, no limit
+            'max_size':-1,  # Max number of cells; if negative, no limit
+            'min_size':-1,  # Min number of cells; if negative, no limit. Min cells is used to reserve capacity for continual learning
             'growth_interval': 200,  # Only if GNG/NG
-            'activity_threshold':0.0,  # Only if GWR, unit value. "The value of the insertion threshold aT does make a large difference, however. If the value is set very close to 1 then more nodes are produced and the input is represented very well. For lower values of aT fewer nodes are added."
+            'activity_threshold':0.0,  # Only if GWR, unit value. "The value of the insertion threshold aT does make a large difference, however. If the value is set very close to 1 then more cells are produced and the input is represented very well. For lower values of aT fewer cells are added."
             'usage_threshold':0.1,  # Threshold at which to allow growth
             'usage_initial':1.0,  # "values used in the experiments were: h_0 = 1"
             'usage_decay':0.8,  # Should be unit range
@@ -99,11 +134,14 @@ class GrowingWhenRequired:
         return dist
 
     def prune_connections(self):
+        max_age = self.hparams['max_age']
+        if max_age < 0:
+            return  # Don't prune, option disabled
+
+        # Remove edges that haven't been used for a while
         listToRemoveE = []
         listToRemoveU = []
 
-        # Remove edges that haven't been used for a while
-        max_age = self.hparams['max_age']
         for u, v, attributes in self.network.edges(data=True):
             if attributes['age'] > max_age:
                 #print('removing edge:', u,v )
@@ -123,18 +161,38 @@ class GrowingWhenRequired:
         except:
             print('Error while removing...')
             print('Edges to remove',listToRemoveE)
-            print('Nodes to remove',listToRemoveU)
+            print('Cells to remove',listToRemoveU)
 
     def number_of_clusters(self):
         return nx.number_connected_components(self.network)
 
+    def cluster_data(self, data):
+        """Cluster the data using connected components of the network graph"""
+        unit_to_cluster = np.zeros(self.units_created)
+        cluster = 0
+        for c in nx.connected_components(self.network):
+            for unit in c:
+                unit_to_cluster[unit] = cluster
+            cluster += 1
+        clustered_data = []
+        for observation in data:
+            nearest_units = self.find_nearest_units(observation)
+            s = nearest_units[0]
+            clustered_data.append((observation, unit_to_cluster[s]))
+        return clustered_data
+
     def plot_clusters(self, clustered_data):
+        """Plot the clusters defined by the graph"""
         number_of_clusters = nx.number_connected_components(self.network)
         plt.clf()
         plt.title('Cluster affectation')
         color = ['r', 'b', 'g', 'k', 'm', 'r', 'b', 'g', 'k', 'm']
         for i in range(number_of_clusters):
-            observations = [observation for observation, s in clustered_data if s == i]
+            observations = []
+            for observation, s in clustered_data:
+                if s.any() == i:
+                    observations.append(observation)
+            #observations = [observation for observation, s in clustered_data if s == i]
             if len(observations) > 0:
                 observations = np.array(observations)
                 plt.scatter(observations[:, 0], observations[:, 1], color=color[i], label='cluster #'+str(i))
@@ -150,15 +208,15 @@ class GrowingWhenRequired:
         w = [np.random.uniform(-init_range, init_range) for _ in range(num_inputs)]
         return w
 
-    def add_node(self, vector):
-        """Ensure we push all node creation through this member fn to standardize properties of the nodes"""
+    def add_cell(self, vector):
+        """Ensure we push all cell creation through this member fn to standardize properties of the cells"""
         error_initial = 0.0
-        usage_initial = self.hparams['usage_initial']
+        usage_initial = self.hparams['usage_initial']  # e.g. 1
         utility_initial = 0.0
-        node_id = self.units_created
-        self.network.add_node(node_id, vector=vector, error=error_initial, usage=usage_initial, utility=utility_initial)
+        cell_id = self.units_created
+        self.network.add_node(cell_id, vector=vector, error=error_initial, usage=usage_initial, utility=utility_initial)
         self.units_created += 1
-        return node_id
+        return cell_id
 
     def reset(self):
         # 0. start with two units a and b at random position w_a and w_b
@@ -166,17 +224,89 @@ class GrowingWhenRequired:
         w_a = self.init()
         w_b = self.init()
         self.network = nx.Graph()
-        self.add_node(w_a)
-        self.add_node(w_b)
+        self.add_cell(w_a)
+        self.add_cell(w_b)
+
+    def can_remove(self):
+        min_size = self.hparams['min_size']
+        num_cells = len(self.network.nodes())
+        #print('grow? sz=', num_cells,'max',max_size)
+        if (min_size < 0):
+            return True  # Can always prune down to any size
+
+        if (num_cells > min_size):
+            return True  # Can prune above this size
+
+        #print('cant prune')
+        return False
 
     def can_grow(self):
         max_size = self.hparams['max_size']
-        num_nodes = len(self.network.nodes())
+        num_cells = len(self.network.nodes())
         #print('grow? sz=', num_nodes,'max',max_size)
-        if (max_size < 0) or (num_nodes < max_size):
+        if (max_size < 0) or (num_cells < max_size):
             return True
         #print('cant grow')
         return False
+
+    def get_size(self):
+        num_cells = len(self.network.nodes())
+        return num_cells
+
+    def remove_cell(self, cell_id):
+        """Removes cell c and all edges to it"""
+        # Remove all edges to this vertex
+        listToRemoveE = []
+        listToRemoveU = []
+
+        for u, v, attributes in self.network.edges(data=True, nbunch=[cell_id]):
+            listToRemoveE.append([u, v])
+
+        # Remove cell
+        listToRemoveU.append(cell_id)
+
+        try:
+            self.network.remove_edges_from(listToRemoveE)
+            self.network.remove_nodes_from(listToRemoveU)
+        except:
+            print('Error while removing...')
+            print('Edges to remove',listToRemoveE)
+            print('Cells to remove',listToRemoveU)
+
+    def choose_remove_cell(self):
+        if not self.can_remove():
+            #print('cant remove, size=', self.get_size())
+            return None  # Can't remove any
+
+        # Find the cell with usage > threshold and min utility
+        usage_threshold = self.hparams['usage_threshold']
+        eligible_cells = []
+        for cell_id in self.network.nodes():
+            cell = self.network.node[cell_id]
+            usage = cell['usage']
+            if usage < usage_threshold:
+                eligible_cells.append(cell_id)
+
+        num_eligible_cells = len(eligible_cells)
+        if num_eligible_cells == 0:
+            print('cant remove, no eligible, size=', self.get_size())
+            return None
+
+        # Find the cell with min utility
+        min_utility = None
+        min_utility_cell = None
+        for cell_id in eligible_cells:
+            cell = self.network.node[cell_id]
+            utility = cell['utility']
+            if min_utility_cell is None:
+                min_utility_cell = cell_id
+                min_utility = utility
+            elif utility < min_utility:
+                min_utility_cell = cell_id
+                min_utility = utility
+
+        print('remove, Eligible cell, util=',min_utility, ' size=', self.get_size())
+        return min_utility_cell
 
     def split_cells(self, q, f):
         w_r = 0.5 * (np.add(self.network.node[q]['vector'], self.network.node[f]['vector']))
@@ -185,7 +315,7 @@ class GrowingWhenRequired:
         #     remove the original edge between q and f
         #self.network.add_node(r, vector=w_r, error=0)
         self.units_created += 1
-        r = self.add_node(w_r)
+        r = self.add_cell(w_r)
         self.network.add_edge(r, q, age=0)
         self.network.add_edge(r, f, age=0)
         self.network.remove_edge(q, f)
@@ -195,12 +325,14 @@ class GrowingWhenRequired:
         self.network.node[q]['error'] *= a
         self.network.node[f]['error'] *= a
         self.network.node[r]['error'] = self.network.node[q]['error']
-        # Assume utility adjusts over time
         
-    def update_usage(self, node_id, is_best):
+        # Usage is set to default usage - ie high.
+        # Assume utility adjusts over time - we won't remove unless usage also low.
+
+    def update_usage(self, cell_id, is_best):
         """Unlike the original GWR paper, I'm just going with a simple exponential decay."""
-        node = self.network.node[node_id]
-        old_usage = node['usage']
+        cell = self.network.node[cell_id]
+        old_usage = cell['usage']
         #if is_best:  # Winner
         #    alpha = 1.05
         #    tau =
@@ -209,15 +341,15 @@ class GrowingWhenRequired:
         #z = num / den * (1.0 - np.exp(-alpha/tau)
         usage_decay = self.hparams['usage_decay']
         new_usage = old_usage * usage_decay
-        node['usage'] = new_usage
+        cell['usage'] = new_usage
 
-    def update_utility(self, node_id, current_utility):
-        """Update the utility of the specified node"""
-        node = self.network.node[node_id]
-        old_utility = node['utility']
+    def update_utility(self, cell_id, current_utility):
+        """Update the utility of the specified cell"""
+        cell = self.network.node[cell_id]
+        old_utility = cell['utility']
         utility_decay = self.hparams['utility_decay']
         new_utility = (old_utility + current_utility) * utility_decay
-        node['usage'] = new_utility
+        cell['usage'] = new_utility
 
     def update(self, observation, step):
         # Get hyperparameters
@@ -225,7 +357,12 @@ class GrowingWhenRequired:
         e_b = self.hparams['learning_rate_best']
         e_n = self.hparams['learning_rate_neighbour']
         l = self.hparams['growth_interval']
-        
+
+        # Consider removing low-utility cells before selecting winners.
+        remove_cell_id = self.choose_remove_cell()
+        if remove_cell_id is not None:
+            self.remove_cell(remove_cell_id)
+
         # 2. find the nearest unit s_1 and the second nearest unit s_2
         nearest_units, nearest_dists = self.find_nearest_units(observation)
         s_1 = nearest_units[0]
@@ -252,8 +389,8 @@ class GrowingWhenRequired:
 
         # 4. add the squared distance between the observation and the nearest unit in input space
         #dist = spatial.distance.euclidean(observation, self.network.node[s_1]['vector'])**2
-        node = self.network.node[s_1]['vector']
-        dist = self.distance(observation, node) **2
+        cell_vector = self.network.node[s_1]['vector']
+        dist = self.distance(observation, cell_vector) **2
         self.network.node[s_1]['error'] += dist  # cumulative error update
 
         did_split = False
@@ -283,7 +420,6 @@ class GrowingWhenRequired:
                 if activity_test and usage_test:
                     self.split_cells(s_1,s_2)  # Create a new cell between s_1 and s_2
                     did_split = True
-
 
         # 5 .move s_1 and its direct topological neighbors towards the observation by the fractions
         #    e_b and e_n, respectively, of the total distance
@@ -333,7 +469,7 @@ class GrowingWhenRequired:
         #accumulated_local_error.append(error)
         return error
     
-    def fit_network(self, data, passes=1, plot_evolution=False):
+    def fit_network(self, data, passes=1, plot_interval=None):
         # logging variables
         accumulated_local_error = []
         global_error = []
@@ -347,44 +483,46 @@ class GrowingWhenRequired:
                 nearest_units, nearest_dists = gng.find_nearest_units(observation)
                 s_1 = nearest_units[0]
                 #global_error += spatial.distance.euclidean(observation, gng.network.node[s_1]['vector'])**2
-                node = gng.network.node[s_1]['vector']
-                dist = self.distance(observation, node)**2
+                cell_vector = gng.network.node[s_1]['vector']
+                dist = self.distance(observation, cell_vector)**2
                 global_error += dist
             return global_error
         
         
-        l = self.hparams['growth_interval']
         d = self.hparams['error_decay']
         
         ## 0. start with two units a and b at random position w_a and w_b
         self.reset()
 
         # 1. iterate through the data
-        sequence = 0
+        step = 0
         for p in range(passes):
             print('   Pass #%d' % (p + 1))
             np.random.shuffle(data)
-            step = 0
-            for observation in data:
+            for i, observation in enumerate(data):
+                #print('i',i)
+                early_stopping = -1
+                if (i > early_stopping) and (early_stopping >= 0):
+                    break
                 error = self.update(observation, step)
+                step += 1
                 accumulated_local_error.append(error)
                 
-                #if step % l == 0:
-                if plot_evolution:
-                    self.plot_network(data, 'visualization/sequence/' + str(sequence) + '.png')
-                sequence += 1
+                if plot_interval is not None:
+                    if step % plot_interval == 0:
+                        # Draw the network to file
+                        self.plot_network(data, 'visualization/sequence/' + str(step) + '.png')
                 
-                network_order.append(self.network.order())
-                network_size.append(self.network.size())
-                total_units.append(self.units_created)
-                
+                network_order.append(self.network.order())  # The order of a graph G is the cardinality of its vertex set
+                network_size.append(self.network.size())  # The size of a graph G is the cardinality of its vertex set,
+                total_units.append(self.units_created)  # Total number created, ever
+
                 # Node error
                 for u in self.network.nodes():
                     self.network.node[u]['error'] *= d
                     if self.network.degree(nbunch=[u]) == 0:
                         print(u)
 
-                step += 1
             global_error.append(compute_global_error(self, data))
         plt.clf()
         plt.title('Accumulated local error')
@@ -403,21 +541,6 @@ class GrowingWhenRequired:
         plt.legend()
         plt.savefig('visualization/network_properties.png')
 
-    def cluster_data(self, data):
-        unit_to_cluster = np.zeros(self.units_created)
-        cluster = 0
-        for c in nx.connected_components(self.network):
-            for unit in c:
-                unit_to_cluster[unit] = cluster
-            cluster += 1
-        clustered_data = []
-        for observation in data:
-            nearest_units = self.find_nearest_units(observation)
-            s = nearest_units[0]
-            clustered_data.append((observation, unit_to_cluster[s]))
-        return clustered_data
-
-        
     def plot_network(self, data, file_path):
         plt.clf()
         plt.scatter(data[:, 0], data[:, 1], c='b')
