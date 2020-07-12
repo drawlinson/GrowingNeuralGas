@@ -133,6 +133,16 @@ class GrowingWhenRequired:
         dist = spatial.distance.euclidean(vector, observation)
         return dist
 
+    def distance_to_data(self, data):
+        total_distance = 0
+        for observation in data:
+            nearest_units, nearest_dists = self.find_nearest_units(observation)
+            s_1 = nearest_units[0]
+            cell_vector = self.network.node[s_1]['vector']
+            dist = self.distance(observation, cell_vector)**2
+            total_distance += dist
+        return total_distance
+
     def prune_connections(self):
         max_age = self.hparams['max_age']
         if max_age < 0:
@@ -181,7 +191,7 @@ class GrowingWhenRequired:
             clustered_data.append((observation, unit_to_cluster[s]))
         return clustered_data
 
-    def plot_clusters(self, clustered_data):
+    def plot_clusters(self, clustered_data, file_path='visualization/clusters.png'):
         """Plot the clusters defined by the graph"""
         number_of_clusters = nx.number_connected_components(self.network)
         plt.clf()
@@ -197,8 +207,20 @@ class GrowingWhenRequired:
                 observations = np.array(observations)
                 plt.scatter(observations[:, 0], observations[:, 1], color=color[i], label='cluster #'+str(i))
         plt.legend()
-        plt.savefig('visualization/clusters.png')
+        plt.savefig(file_path)
 
+    def plot_network(self, data, file_path):
+        """Plots the network on top of a set of data points"""
+        plt.clf()
+        plt.title('Network nodes and edges')
+        plt.scatter(data[:, 0], data[:, 1], c='b')
+        node_pos = {}
+        for u in self.network.nodes():
+            vector = self.network.node[u]['vector']
+            node_pos[u] = (vector[0], vector[1])
+        nx.draw(self.network, pos=node_pos, node_color='r')
+        plt.draw()
+        plt.savefig(file_path)
 
     def init(self):
         #w_shape = np.shape(self.data)[1]
@@ -356,7 +378,8 @@ class GrowingWhenRequired:
         growth_strategy = self.hparams['growth_strategy']
         e_b = self.hparams['learning_rate_best']
         e_n = self.hparams['learning_rate_neighbour']
-        l = self.hparams['growth_interval']
+        growth_interval = self.hparams['growth_interval']
+        error_decay = self.hparams['error_decay']
 
         # Consider removing low-utility cells before selecting winners.
         remove_cell_id = self.choose_remove_cell()
@@ -444,7 +467,7 @@ class GrowingWhenRequired:
         step += 1
         if growth_strategy == GrowingWhenRequired.GrowthStrategyInterval:
             if self.can_grow():
-                if step % l == 0:
+                if step % growth_interval == 0:
                     # 8.a determine the unit q with the maximum accumulated error
                     q = 0
                     error_max = 0
@@ -463,6 +486,10 @@ class GrowingWhenRequired:
                     self.split_cells(q,f)  # Create a new cell between q and f
 
         # 9. decrease all error variables by multiplying them with a constant d
+        for u in self.network.nodes():
+            self.network.node[u]['error'] *= error_decay
+
+        # 10. Calculate the total current network 'error' which is integrated over many samples
         error = 0
         for u in self.network.nodes():
             error += self.network.node[u]['error']
@@ -476,21 +503,7 @@ class GrowingWhenRequired:
         network_order = []
         network_size = []
         total_units = []
-        
-        def compute_global_error(gng, data):
-            global_error = 0
-            for observation in data:
-                nearest_units, nearest_dists = gng.find_nearest_units(observation)
-                s_1 = nearest_units[0]
-                #global_error += spatial.distance.euclidean(observation, gng.network.node[s_1]['vector'])**2
-                cell_vector = gng.network.node[s_1]['vector']
-                dist = self.distance(observation, cell_vector)**2
-                global_error += dist
-            return global_error
-        
-        
-        d = self.hparams['error_decay']
-        
+
         ## 0. start with two units a and b at random position w_a and w_b
         self.reset()
 
@@ -517,13 +530,7 @@ class GrowingWhenRequired:
                 network_size.append(self.network.size())  # The size of a graph G is the cardinality of its vertex set,
                 total_units.append(self.units_created)  # Total number created, ever
 
-                # Node error
-                for u in self.network.nodes():
-                    self.network.node[u]['error'] *= d
-                    if self.network.degree(nbunch=[u]) == 0:
-                        print(u)
-
-            global_error.append(compute_global_error(self, data))
+            global_error.append(gng.distance_to_data(data))
         plt.clf()
         plt.title('Accumulated local error')
         plt.xlabel('iterations')
@@ -540,16 +547,3 @@ class GrowingWhenRequired:
         plt.plot(range(len(network_size)), network_size, label='Network size')
         plt.legend()
         plt.savefig('visualization/network_properties.png')
-
-    def plot_network(self, data, file_path):
-        plt.clf()
-        plt.scatter(data[:, 0], data[:, 1], c='b')
-        node_pos = {}
-        for u in self.network.nodes():
-            vector = self.network.node[u]['vector']
-            node_pos[u] = (vector[0], vector[1])
-        nx.draw(self.network, pos=node_pos, node_color='r')
-        plt.draw()
-        plt.savefig(file_path)
-
-            
